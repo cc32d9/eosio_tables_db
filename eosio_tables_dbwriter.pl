@@ -95,7 +95,7 @@ my $tbl_upd_prev = $network . '_UPD_PREV'; # row values before updates
                  'contract  VARCHAR(13) NOT NULL, ' .
                  'scope     VARCHAR(13) NOT NULL, ' .
                  'tbl       VARCHAR(13) NOT NULL, ' .
-                 'pk        BIGINT UNSIGNED NOT NULL, ' .
+                 'pk        BIGINT UNSIGNED NOT NULL, ' . # primary key as hex string
                  'field     VARCHAR(64) NOT NULL, ' .
                  'fval      TEXT NULL) ENGINE=InnoDB;');
 
@@ -111,8 +111,8 @@ my $tbl_upd_prev = $network . '_UPD_PREV'; # row values before updates
         
         $dbh->do('CREATE TABLE ' . $tbl_upd_op . '( ' .
                  'block_num BIGINT UNSIGNED NOT NULL, ' .
-                 'op        TINYINT NOT NULL, ' .     # row operation: 1=new, 2=modified, 3=deleted
                  'opseq     INT UNSIGNED NOT NULL, ' .
+                 'op        TINYINT NOT NULL, ' .     # row operation: 1=new, 2=modified, 3=deleted
                  'contract  VARCHAR(13) NOT NULL, ' .
                  'scope     VARCHAR(13) NOT NULL, ' .
                  'tbl       VARCHAR(13) NOT NULL, ' .
@@ -176,8 +176,12 @@ my $sth_del_op = $dbh->prepare
 my $sth_clean_op = $dbh->prepare
     ('DELETE FROM ' . $tbl_upd_op . ' WHERE block_num <= ?');
 
+my $sth_select_op_fork_blocks = $dbh->prepare
+    ('SELECT DISTINCT block_num FROM ' . $tbl_upd_op . ' ' .
+     'WHERE block_num >= ? ORDER BY block_num DESC');
+
 my $sth_select_op = $dbh->prepare
-    ('SELECT op, opseq, contract, scope, tbl, pk FROM ' . $tbl_upd_op . ' ' .
+    ('SELECT opseq, op, contract, scope, tbl, pk FROM ' . $tbl_upd_op . ' ' .
      'WHERE block_num=? ORDER BY opseq DESC');
 
 
@@ -260,10 +264,13 @@ sub process_data
         print STDERR "fork at $block_num\n";
 
         # roll back to the fork point
-        while( $uncommitted_block >= $block_num )
+        $sth_select_op_fork_blocks->execute($block_num);
+        my $forkblocks = $sth_select_op_fork_blocks->fetchall_arrayref();
+        foreach my $fb (@{$forkblocks})
         {
+            my $bn = $fb->[0];
             my %prevval;
-            $sth_select_prev->execute($uncommitted_block);
+            $sth_select_prev->execute($bn);
             while(my $vrow = $sth_select_prev->fetchrow_arrayref())
             {
                 my ($seq, $contract, $scope, $tbl, $pk, $field, $fval) = @{$vrow};
@@ -271,7 +278,7 @@ sub process_data
             }
 
             
-            $sth_select_op->execute($uncommitted_block);
+            $sth_select_op->execute($bn);
             my $r = $sth_select_op->fetchall_arrayref();
             foreach my $oprec (@{$r})
             {
@@ -306,16 +313,17 @@ sub process_data
                     }
                 }
             }
-            $sth_del_op->execute($uncommitted_block);
-            $sth_del_prev->execute($uncommitted_block);
-            printf STDERR ("Rolled back block %d\n", $uncommitted_block);
+            $sth_del_op->execute($bn);
+            $sth_del_prev->execute($bn);
+            printf STDERR ("Rolled back block %d\n", $bn);
             $uncommitted_block--;
         }
         
         $dbh->commit();
+        $uncommitted_block = $block_num-1;
         $stored_block = $uncommitted_block;
         $opseq = 0;
-        return $block_num-1;
+        return $uncommitted_block;
     }
     elsif( $msgtype == 1007 ) # CHRONICLE_MSGTYPE_TBL_ROW
     {
@@ -360,13 +368,16 @@ sub process_data
             }
         }
         
-        if( $block_num > $last_irreversible and $op != 1 )
+        if( $block_num > $last_irreversible )
         {
             # row modified or deleted; save the previous values
             $sth_ins_op->execute($block_num, $opseq, $op, $contract, $scope, $tbl, $pk);
-            foreach my $prevval (@{$prevrow})
+            if( $op != 1 )
             {
-                $sth_ins_prev->execute($block_num, $opseq, $contract, $scope, $tbl, $pk, @{$prevval});
+                foreach my $prevval (@{$prevrow})
+                {
+                    $sth_ins_prev->execute($block_num, $opseq, $contract, $scope, $tbl, $pk, @{$prevval});
+                }
             }
         }
 
