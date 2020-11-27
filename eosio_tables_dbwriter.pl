@@ -61,6 +61,7 @@ my $dbh = DBI->connect($dsn, $db_user, $db_password,
                         mariadb_server_prepare => 1});
 die($DBI::errstr) unless $dbh;
 
+my $last_irreversible = 0;
 my $committed_block = 0;
 my $stored_block = 0;
 my $uncommitted_block = 0;
@@ -77,8 +78,8 @@ my $uncommitted_block = 0;
 }
 
 my $tbl_rows = $network . '_ROWS';
-my $tbl_upd_prev = $network . '_UPD_PREV';
-my $tbl_upd_new = $network . '_UPD_NEW';
+my $tbl_upd_prev = $network . '_UPD_PREV'; # row values before updates
+my $tbl_upd_op = $network . '_UPD_OP';     # row operation: new/modified/deleted
 
 {
     my $sth = $dbh->prepare
@@ -93,7 +94,7 @@ my $tbl_upd_new = $network . '_UPD_NEW';
                  'contract  VARCHAR(13) NOT NULL, ' .
                  'scope     VARCHAR(13) NOT NULL, ' .
                  'tbl       VARCHAR(13) NOT NULL, ' .
-                 'pk        BIGINT NOT NULL, ' .
+                 'pk        BIGINT UNSIGNED NOT NULL, ' .
                  'field     VARCHAR(64) NOT NULL, ' .
                  'fval      TEXT NOT NULL) ENGINE=InnoDB;');
 
@@ -108,30 +109,31 @@ my $tbl_upd_new = $network . '_UPD_NEW';
 
         
         $dbh->do('CREATE TABLE ' . $tbl_upd_prev . '( ' .
-                 'block_num  BIGINT NOT NULL, ' .
+                 'block_num  BIGINT UNSIGNED NOT NULL, ' .
                  'contract  VARCHAR(13) NOT NULL, ' .
                  'scope     VARCHAR(13) NOT NULL, ' .
                  'tbl       VARCHAR(13) NOT NULL, ' .
-                 'pk        BIGINT NOT NULL, ' .
+                 'pk        BIGINT UNSIGNED NOT NULL, ' .
                  'field     VARCHAR(64) NOT NULL, ' .
                  'fval      TEXT NOT NULL) ENGINE=InnoDB;');
 
         $dbh->do('CREATE UNIQUE INDEX ' . $tbl_upd_prev . '_I01 ON ' . $tbl_upd_prev .
                  '(block_num)');
 
-        $dbh->do('CREATE TABLE ' . $tbl_upd_new . '( ' .
-                 'block_num  BIGINT NOT NULL, ' .
+        $dbh->do('CREATE TABLE ' . $tbl_upd_op . '( ' .
+                 'block_num BIGINT UNSIGNED NOT NULL, ' .
+                 'op        TINYINT NOT NULL, ' .     # row operation: 1=new, 2=modified, 3=deleted
                  'contract  VARCHAR(13) NOT NULL, ' .
                  'scope     VARCHAR(13) NOT NULL, ' .
                  'tbl       VARCHAR(13) NOT NULL, ' .
-                 'pk        BIGINT NOT NULL) ENGINE=InnoDB;');
+                 'pk        BIGINT UNSIGNED NOT NULL) ENGINE=InnoDB;');
 
-        $dbh->do('CREATE UNIQUE INDEX ' . $tbl_upd_new . '_I01 ON ' . $tbl_upd_new .
+        $dbh->do('CREATE INDEX ' . $tbl_upd_op . '_I01 ON ' . $tbl_upd_op .
                  '(block_num)');
 
         $dbh->do
             ('INSERT INTO SYNC (network, block_num, block_time, irreversible) ' .
-             'VALUES(\'' . $network . '\',0,\'2020-01-01\', 0) ' .
+             'VALUES(\'' . $network . '\',0,\'2000-01-01\', 0) ' .
              'ON DUPLICATE KEY UPDATE block_num=0, block_time=\'2020-01-01\', irreversible=0');
     }
 }
@@ -143,7 +145,55 @@ my $sth_upd_sync = $dbh->prepare
 my $sth_fork_sync = $dbh->prepare
     ('UPDATE SYNC SET block_num=? WHERE network = ?');
 
+my $sth_check_row = $dbh->prepare
+    ('SELECT field, fval FROM ' . $tbl_rows . ' ' .
+     'WHERE contract=? AND scope=? AND tbl=? AND pk=?');
+
+my $sth_upd_field = $dbh->prepare
+    ('UPDATE ' . $tbl_rows . ' SET fval=? ' .
+     'WHERE contract=? AND scope=? AND tbl=? AND pk=? AND field=?');
+
+my $sth_ins_field = $dbh->prepare
+    ('INSERT INTO ' . $tbl_rows . ' (contract, scope, tbl, pk, field, fval) ' .
+     'VALUES(?,?,?,?,?,?)');
+
+my $sth_del_row = $dbh->prepare
+    ('DELETE FROM ' . $tbl_rows . ' ' .
+     'WHERE contract=? AND scope=? AND tbl=? AND pk=?');
+
+my $sth_ins_prev = $dbh->prepare
+    ('INSERT INTO ' . $tbl_upd_prev . ' (block_num, contract, scope, tbl, pk, field, fval) ' .
+     'VALUES(?,?,?,?,?,?,?)');
+
+my $sth_del_prev = $dbh->prepare
+        ('DELETE FROM ' . $tbl_upd_prev . ' ' .
+         'WHERE block_num=?');
+
+my $sth_clean_prev = $dbh->prepare
+    ('DELETE FROM ' . $tbl_upd_prev . ' WHERE block_num <= ?');
+
+my $sth_select_prev = $dbh->prepare
+    ('SELECT contract, scope, tbl, pk, field, fval FROM ' . $tbl_upd_prev . ' ' .
+     'WHERE block_num=?');
+
+my $sth_ins_op = $dbh->prepare
+    ('INSERT INTO ' . $tbl_upd_op . ' (block_num, op, contract, scope, tbl, pk) ' .
+     'VALUES(?,?,?,?,?,?)');
+
+my $sth_del_op = $dbh->prepare
+        ('DELETE FROM ' . $tbl_upd_op . ' WHERE block_num=?');
+
+my $sth_clean_op = $dbh->prepare
+    ('DELETE FROM ' . $tbl_upd_op . ' WHERE block_num <= ?');
+
+my $sth_select_op = $dbh->prepare
+    ('SELECT op, contract, scope, tbl, pk FROM ' . $tbl_upd_op . ' ' .
+     'WHERE block_num=?');
+
+
+
 my $json = JSON->new;
+$json->canonical;
 
 my $blocks_counter = 0;
 my $rows_counter = 0;
@@ -201,8 +251,153 @@ sub process_data
     {
         my $block_num = $data->{'block_num'};
         print STDERR "fork at $block_num\n";
-        $uncommitted_block = 0;
+
+        # roll back to the fork point
+        while( $uncommitted_block > $block_num )
+        {
+            my %prevval;
+            $sth_select_prev->execute($uncommitted_block);
+            while(my $vrow = $sth_select_prev->fetchrow_array())
+            {
+                my ($contract, $scope, $tbl, $pk, $field, $fval) = @{$vrow};
+                $prevval{$contract}{$scope}{$tbl}{$pk}{$field} = $fval;
+            }
+
+            
+            $sth_select_op->execute($uncommitted_block);
+            my $r = $sth_select_op->fetchall_arrayref();
+            foreach my $oprec (@{$r})
+            {
+                my ($op, $contract, $scope, $tbl, $pk) = @{$oprec};
+                if( $op == 1 )
+                {
+                    # row was inserted, now delete it
+                    $sth_del_row->execute($contract, $scope, $tbl, $pk);
+                }
+                else
+                {
+                    if( not defined($prevval{$contract}{$scope}{$tbl}{$pk}) )
+                    {
+                        print STDERR "Cannot find previous value for " .
+                            join(',', $contract, $scope, $tbl, $pk) . "\n";
+                    }
+                    else
+                    {
+                        while(my ($field, $fval) = each %{$prevval{$contract}{$scope}{$tbl}{$pk}})
+                        {
+                            if( $op == 2 )
+                            {
+                                # updated row, updating it back
+                                $sth_upd_field->execute($fval, $contract, $scope, $tbl, $pk, $field);
+                            }
+                            else
+                            {
+                                # deleted row, restore it back
+                                $sth_ins_field->execute($contract, $scope, $tbl, $pk, $field, $fval);
+                            }
+                        }
+                    }
+                }
+            }
+            $sth_del_op->execute($uncommitted_block);
+            $sth_del_prev->execute($uncommitted_block);
+            $uncommitted_block--;
+        }
+        
+        $dbh->commit();
+        $stored_block = $uncommitted_block;
         return $block_num-1;
+    }
+    elsif( $msgtype == 1007 ) # CHRONICLE_MSGTYPE_TBL_ROW
+    {
+        my $kvo = $data->{'kvo'};
+        return(0) unless ref($kvo->{'value'}) eq 'HASH';
+
+        my $block_num = $data->{'block_num'};
+        my $contract = $kvo->{'code'};
+        my $scope = $kvo->{'scope'};
+        my $tbl = $kvo->{'table'};
+        my $pk = $kvo->{'primary_key'};
+
+        my $op;
+        
+        $sth_check_row->execute($contract, $scope, $tbl, $pk);
+        my $r = $sth_check_row->fetchall_arrayref();
+        if( scalar(@{$r}) > 0 )
+        {
+            if( $block_num > $last_irreversible )
+            {
+                # save the previous values
+                foreach my $prevval (@{$r})
+                {
+                    $sth_ins_prev->execute($block_num, $contract, $scope, $tbl, $pk, @{$prevval});
+                }
+            }
+                
+            if( $data->{'added'} eq 'true' )
+            {
+                # this is an update of existing row
+                $op = 2;
+            }
+            else
+            {
+                # the row is deleted
+                $op = 3;
+            }
+        }
+        else
+        {
+            if( $data->{'added'} eq 'true' )
+            {
+                # this is a new row
+                $op = 1;
+            }
+            else
+            {
+                #print STDERR "Database corrupted, row deleted but does not exist: " .
+                #    join(',', $contract, $scope, $tbl, $pk) . "\n";
+                return 0;
+            }
+        }
+        
+        if( $block_num > $last_irreversible )
+        {
+            $sth_ins_op->execute($block_num, $op, $contract, $scope, $tbl, $pk);
+        }
+
+        if( $op != 3 ) # row inserted or modified
+        {
+            while(my ($field, $fval) = each %{$kvo->{'value'}})
+            {
+                if( ref($fval) ne '' )
+                {
+                    if( JSON::is_bool($fval) )
+                    {
+                        $fval = scalar($fval);
+                    }
+                    else
+                    {
+                        $fval = $json->encode($fval);
+                    }
+                }
+
+                if( $op == 1 )
+                {
+                    # new row
+                    $sth_ins_field->execute($contract, $scope, $tbl, $pk, $field, $fval);
+                }
+                elsif( $op == 2 )
+                {
+                    # updated row
+                    $sth_upd_field->execute($fval, $contract, $scope, $tbl, $pk, $field);
+                }
+            }
+        }
+        else
+        {
+            # row deleted
+            $sth_del_row->execute($contract, $scope, $tbl, $pk);
+        }                    
     }
     elsif( $msgtype == 1009 ) # CHRONICLE_MSGTYPE_RCVR_PAUSE
     {
@@ -222,6 +417,15 @@ sub process_data
     {
         $blocks_counter++;
         $uncommitted_block = $data->{'block_num'};
+
+        my $old_last_irrev = $last_irreversible;
+        $last_irreversible = $data->{'last_irreversible'};
+        if( $old_last_irrev < $last_irreversible )
+        {
+            $sth_clean_prev->execute($last_irreversible);
+            $sth_clean_op->execute($last_irreversible);
+        }
+                
         if( $uncommitted_block - $committed_block >= $commit_every or
             $uncommitted_block >= $endblock )
         {
@@ -244,7 +448,9 @@ sub process_data
             
             if( $uncommitted_block > $stored_block )
             {
-                $sth_upd_sync->execute($network, $uncommitted_block, $uncommitted_block);
+                my $block_time = $data->{'block_timestamp'};
+                $block_time =~ s/T/ /;
+                $sth_upd_sync->execute($uncommitted_block, $block_time, $last_irreversible, $network);
                 $dbh->commit();
                 $stored_block = $uncommitted_block;
             }
