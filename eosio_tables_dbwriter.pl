@@ -61,7 +61,7 @@ my $dbh = DBI->connect($dsn, $db_user, $db_password,
                         mariadb_server_prepare => 1});
 die($DBI::errstr) unless $dbh;
 
-my $last_irreversible = 0;
+my $last_irreversible = 2**32 - 1;
 my $committed_block = 0;
 my $stored_block = 0;
 my $uncommitted_block = 0;
@@ -160,6 +160,11 @@ my $sth_upd_field = $dbh->prepare
 my $sth_ins_field = $dbh->prepare
     ('INSERT INTO ' . $tbl_rows . ' (contract, scope, tbl, pk, field, fval) ' .
      'VALUES(?,?,?,?,?,?)');
+
+my $sth_ins_fast_field = $dbh->prepare
+    ('INSERT INTO ' . $tbl_rows . ' (contract, scope, tbl, pk, field, fval) ' .
+     'VALUES(?,?,?,?,?,?) ' .
+     'ON DUPLICATE KEY UPDATE fval=?');
 
 my $sth_del_row = $dbh->prepare
     ('DELETE FROM ' . $tbl_rows . ' ' .
@@ -336,40 +341,40 @@ sub process_data
         my $tbl = $kvo->{'table'};
         my $pk = $kvo->{'primary_key'};
 
-        my $op;
-        
-        $sth_check_row->execute($contract, $scope, $tbl, $pk);
-        my $prevrow = $sth_check_row->fetchall_arrayref();
-        if( scalar(@{$prevrow}) > 0 )
-        {               
-            if( $data->{'added'} eq 'true' )
-            {
-                # this is an update of existing row
-                $op = 2;
-            }
-            else
-            {
-                # the row is deleted
-                $op = 3;
-            }
-        }
-        else
-        {
-            if( $data->{'added'} eq 'true' )
-            {
-                # this is a new row
-                $op = 1;
-            }
-            else
-            {
-                #print STDERR "Database corrupted, row deleted but does not exist: " .
-                #    join(',', $contract, $scope, $tbl, $pk) . "\n";
-                return 0;
-            }
-        }
-        
         if( $block_num > $last_irreversible )
         {
+            my $op;
+            
+            $sth_check_row->execute($contract, $scope, $tbl, $pk);
+            my $prevrow = $sth_check_row->fetchall_arrayref();
+            if( scalar(@{$prevrow}) > 0 )
+            {               
+                if( $data->{'added'} eq 'true' )
+                {
+                    # this is an update of existing row
+                    $op = 2;
+                }
+                else
+                {
+                    # the row is deleted
+                    $op = 3;
+                }
+            }
+            else
+            {
+                if( $data->{'added'} eq 'true' )
+                {
+                    # this is a new row
+                    $op = 1;
+                }
+                else
+                {
+                    #print STDERR "Database corrupted, row deleted but does not exist: " .
+                    #    join(',', $contract, $scope, $tbl, $pk) . "\n";
+                    return 0;
+                }
+            }
+        
             # row modified or deleted; save the previous values
             $sth_ins_op->execute($block_num, $opseq, $op, $contract, $scope, $tbl, $pk);
             if( $op != 1 )
@@ -379,43 +384,72 @@ sub process_data
                     $sth_ins_prev->execute($block_num, $opseq, $contract, $scope, $tbl, $pk, @{$prevval});
                 }
             }
-        }
-
-        if( $op != 3 ) # row inserted or modified
-        {
-            while(my ($field, $fval) = each %{$kvo->{'value'}})
+            
+            if( $op != 3 ) # row inserted or modified
             {
-                if( ref($fval) ne '' )
+                while(my ($field, $fval) = each %{$kvo->{'value'}})
                 {
-                    if( JSON::is_bool($fval) )
+                    if( ref($fval) ne '' )
                     {
-                        $fval = scalar($fval);
+                        if( JSON::is_bool($fval) )
+                        {
+                            $fval = scalar($fval);
+                        }
+                        else
+                        {
+                            $fval = $json->encode($fval);
+                        }
                     }
-                    else
-                    {
-                        $fval = $json->encode($fval);
-                    }
-                }
 
-                if( $op == 1 )
-                {
-                    # new row
-                    $sth_ins_field->execute($contract, $scope, $tbl, $pk, $field, $fval);
-                }
-                elsif( $op == 2 )
-                {
-                    # updated row
-                    $sth_upd_field->execute($fval, $contract, $scope, $tbl, $pk, $field);
+                    if( $op == 1 )
+                    {
+                        # new row
+                        $sth_ins_field->execute($contract, $scope, $tbl, $pk, $field, $fval);
+                    }
+                    elsif( $op == 2 )
+                    {
+                        # updated row
+                        $sth_upd_field->execute($fval, $contract, $scope, $tbl, $pk, $field);
+                    }
                 }
             }
+            else
+            {
+                # row deleted
+                $sth_del_row->execute($contract, $scope, $tbl, $pk);
+            }
+
+            $opseq++;
         }
         else
         {
-            # row deleted
-            $sth_del_row->execute($contract, $scope, $tbl, $pk);
-        }
+            # this is irreversible update, do the fast track
+            if( $data->{'added'} eq 'true' )
+            {
+                while(my ($field, $fval) = each %{$kvo->{'value'}})
+                {
+                    if( ref($fval) ne '' )
+                    {
+                        if( JSON::is_bool($fval) )
+                        {
+                            $fval = scalar($fval);
+                        }
+                        else
+                        {
+                            $fval = $json->encode($fval);
+                        }
+                    }
 
-        $opseq++;
+                    $sth_ins_fast_field->execute($contract, $scope, $tbl, $pk, $field, $fval, $fval);
+                }
+            }
+            else
+            {
+                # row deleted
+                $sth_del_row->execute($contract, $scope, $tbl, $pk);
+            }
+        }            
+        
         $rows_counter++;
     }
     elsif( $msgtype == 1009 ) # CHRONICLE_MSGTYPE_RCVR_PAUSE
