@@ -108,6 +108,8 @@ my $tbl_upd_prev = $network . '_UPD_PREV'; # row values before updates
         $dbh->do('CREATE INDEX ' . $tbl_rows . '_I03 ON ' . $tbl_rows .
                  '(contract, tbl, field, fval(64))');
 
+        $dbh->do('CREATE INDEX ' . $tbl_rows . '_I04 ON ' . $tbl_rows .
+                 '(fval(64))');
         
         $dbh->do('CREATE TABLE ' . $tbl_upd_op . '( ' .
                  'block_num BIGINT UNSIGNED NOT NULL, ' .
