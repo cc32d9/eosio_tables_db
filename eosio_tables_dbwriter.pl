@@ -78,6 +78,19 @@ my $opseq = 0;
     }
 }
 
+my %watchcontracts;
+{
+    my $sth = $dbh->prepare
+        ('SELECT contract FROM WATCH_CONTRACTS WHERE network=?');
+    $sth->execute($network);
+    my $r = $sth->fetchall_arrayref();
+    die('nothing in WATCH_CONTRACTS') if scalar(@{$r}) == 0;
+    foreach my $row (@{$r}) {
+        $watchcontracts{$row->[0]} = 1;
+        print STDERR "Watching contract: " . $row->[0] . "\n"; 
+    }
+}
+
 my $tbl_rows = $network . '_ROWS';
 my $tbl_upd_op = $network . '_UPD_OP';     # row operation: new/modified/deleted
 my $tbl_upd_prev = $network . '_UPD_PREV'; # row values before updates
@@ -97,7 +110,7 @@ my $tbl_upd_prev = $network . '_UPD_PREV'; # row values before updates
                  'tbl       VARCHAR(13) NOT NULL, ' .
                  'pk        BIGINT UNSIGNED NOT NULL, ' . # primary key as hex string
                  'field     VARCHAR(64) NOT NULL, ' .
-                 'fval      TEXT NULL) ENGINE=InnoDB;');
+                 'fval      LONGTEXT NULL) ENGINE=InnoDB;');
 
         $dbh->do('CREATE UNIQUE INDEX ' . $tbl_rows . '_I01 ON ' . $tbl_rows .
                  '(contract, scope, tbl, pk, field)');
@@ -335,10 +348,12 @@ sub process_data
     elsif( $msgtype == 1007 ) # CHRONICLE_MSGTYPE_TBL_ROW
     {
         my $kvo = $data->{'kvo'};
+        my $contract = $kvo->{'code'};
+
+        return(0) unless exists($watchcontracts{$contract});
         return(0) unless ref($kvo->{'value'}) eq 'HASH';
 
         my $block_num = $data->{'block_num'};
-        my $contract = $kvo->{'code'};
         my $scope = $kvo->{'scope'};
         my $tbl = $kvo->{'table'};
         my $pk = $kvo->{'primary_key'};

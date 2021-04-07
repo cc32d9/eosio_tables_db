@@ -12,7 +12,7 @@ After=mariadb.service
 Type=simple
 EnvironmentFile=/etc/default/eosio_tables_%i
 
-ExecStart=/usr/bin/perl /opt/eosio_tables/eosio_tables_dbwriter.pl --network=%i $DBWRITE_OPTS
+ExecStart=/usr/bin/perl /opt/eosio_tables_db/eosio_tables_dbwriter.pl --network=%i $DBWRITE_OPTS
 TimeoutSec=45s
 Restart=always
 User=root
