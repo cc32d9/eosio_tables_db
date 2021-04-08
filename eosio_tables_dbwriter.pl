@@ -1,5 +1,5 @@
 # install dependencies:
-#  sudo apt install cpanminus libjson-xs-perl libjson-perl libmysqlclient-dev libdbi-perl
+#  sudo apt install cpanminus libjson-xs-perl libjson-perl libmysqlclient-dev libdbi-perl libredis-fast-perl
 #  sudo cpanm Net::WebSocket::Server
 #  sudo cpanm DBD::MariaDB
 
@@ -10,7 +10,7 @@ use Getopt::Long;
 use DBI;
 use Time::HiRes qw (time);
 use Time::Local 'timegm_nocheck';
-
+use Redis::Fast;
 use Net::WebSocket::Server;
 use Protocol::WebSocket::Frame;
 
@@ -29,6 +29,12 @@ my $db_password = 'Ohch3ook';
 my $commit_every = 10;
 my $endblock = 2**32 - 1;
 
+my $use_redis;
+my $redis_server;
+my @redis_sentinels;
+my $redis_service;
+my $redis_queue = 'tblupd';
+
 
 my $ok = GetOptions
     ('network=s' => \$network,
@@ -38,6 +44,11 @@ my $ok = GetOptions
      'dsn=s'     => \$dsn,
      'dbuser=s'  => \$db_user,
      'dbpw=s'    => \$db_password,
+     'useredis'  => \$use_redis,
+     'redis_server=s'    => \$redis_server,
+     'redis_sentinels=s' => \@redis_sentinels,
+     'redis_service=s'   => \$redis_service,
+     'redis_queue=s'     => \$redis_queue,
     );
 
 
@@ -51,10 +62,41 @@ if( not $network or not $ok or scalar(@ARGV) > 0 )
         "  --endblock=N       \[$endblock\] Stop before given block\n",
         "  --dsn=DSN          \[$dsn\]\n",
         "  --dbuser=USER      \[$db_user\]\n",
-        "  --dbpw=PASSWORD    \[$db_password\]\n";
+        "  --dbpw=PASSWORD    \[$db_password\]\n",
+        "  --useredis         push table updates to Redis queue\n",
+        "  --redis_server=SRV\n",
+        "  --redis_sentinels=S1 --redis_sentinels=S2...\n",
+        "  --redis_service=SVC\n",
+        "  --redis_queue=Q    \[$redis_queue\]\n";
+    
     exit 1;
 }
 
+
+my $redis;
+if( $use_redis )
+{
+    my %args;
+    if( scalar(@redis_sentinels) > 0 )
+    {
+        die("--redis_service undefined") unless defined($redis_service);
+        %args = (
+            sentinels => \@redis_sentinels,
+            service => $redis_service,
+            sentinels_cnx_timeout => 0.1,
+            sentinels_read_timeout => 1,
+            sentinels_write_timeout => 1);
+    }
+    elsif( defined($redis_server) )
+    {
+        %args = (
+            server => $redis_server,
+            reconnect => 60, every => 1000000);
+    }
+
+    $redis = Redis::Fast->new(%args);
+}
+    
 
 my $dbh = DBI->connect($dsn, $db_user, $db_password,
                        {'RaiseError' => 1, AutoCommit => 0,
@@ -89,6 +131,20 @@ my %watchcontracts;
         $watchcontracts{$row->[0]} = 1;
         print STDERR "Watching contract: " . $row->[0] . "\n"; 
     }
+}
+
+
+my %redisexport;
+if( $use_redis )
+{
+    my $sth = $dbh->prepare
+        ('SELECT contract FROM EXPORT_TBL_UPDATES WHERE network=?');
+    $sth->execute($network);
+    my $r = $sth->fetchall_arrayref();
+    foreach my $row (@{$r}) {
+        $redisexport{$row->[0]} = 1;
+        print STDERR "Exporting contract deltas: " . $row->[0] . "\n"; 
+    }    
 }
 
 my $tbl_rows = $network . '_ROWS';
@@ -247,7 +303,7 @@ Net::WebSocket::Server->new(
                     exit;
                 } 
                 
-                my $ack = process_data($msgtype, $data);
+                my $ack = process_data($msgtype, $data, \$js);
                 if( $ack > 0 )
                 {
                     $conn->send_binary(sprintf("%d", $ack));
@@ -277,6 +333,7 @@ sub process_data
 {
     my $msgtype = shift;
     my $data = shift;
+    my $jsref = shift;
 
     if( $msgtype == 1001 ) # CHRONICLE_MSGTYPE_FORK
     {
@@ -353,6 +410,10 @@ sub process_data
         return(0) unless exists($watchcontracts{$contract});
         return(0) unless ref($kvo->{'value'}) eq 'HASH';
 
+        if( exists($redisexport{$contract}) ) {
+            $redis->lpush($redis_queue, *$js);
+        }
+        
         my $block_num = $data->{'block_num'};
         my $scope = $kvo->{'scope'};
         my $tbl = $kvo->{'table'};
