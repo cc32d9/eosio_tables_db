@@ -166,7 +166,7 @@ my $tbl_upd_prev = $network . '_UPD_PREV'; # row values before updates
                  'tbl       VARCHAR(13) NOT NULL, ' .
                  'pk        BIGINT UNSIGNED NOT NULL, ' . # primary key as hex string
                  'field     VARCHAR(64) NOT NULL, ' .
-                 'fval      LONGTEXT NULL) ENGINE=InnoDB;');
+                 'fval      LONGBLOB NULL) ENGINE=InnoDB;');
 
         $dbh->do('CREATE UNIQUE INDEX ' . $tbl_rows . '_I01 ON ' . $tbl_rows .
                  '(contract, scope, tbl, pk, field)');
@@ -201,7 +201,7 @@ my $tbl_upd_prev = $network . '_UPD_PREV'; # row values before updates
                  'tbl       VARCHAR(13) NOT NULL, ' .
                  'pk        BIGINT UNSIGNED NOT NULL, ' .
                  'field     VARCHAR(64) NOT NULL, ' .
-                 'fval      TEXT NULL) ENGINE=InnoDB;');
+                 'fval      LONGBLOB NULL) ENGINE=InnoDB;');
 
         $dbh->do('CREATE INDEX ' . $tbl_upd_prev . '_I01 ON ' . $tbl_upd_prev .
                  '(block_num, opseq)');
@@ -411,7 +411,7 @@ sub process_data
         return(0) unless ref($kvo->{'value'}) eq 'HASH';
 
         if( exists($redisexport{$contract}) ) {
-            $redis->lpush($redis_queue, *$js);
+            $redis->lpush($redis_queue, *$jsref);
         }
         
         my $block_num = $data->{'block_num'};
