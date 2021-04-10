@@ -411,7 +411,7 @@ sub process_data
         return(0) unless ref($kvo->{'value'}) eq 'HASH';
 
         if( exists($redisexport{$contract}) ) {
-            $redis->lpush($redis_queue, *$jsref);
+            $redis->lpush($redis_queue, ${$jsref});
         }
         
         my $block_num = $data->{'block_num'};
