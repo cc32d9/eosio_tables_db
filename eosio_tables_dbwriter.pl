@@ -16,7 +16,7 @@ use Protocol::WebSocket::Frame;
 
 $Protocol::WebSocket::Frame::MAX_PAYLOAD_SIZE = 100*1024*1024;
 $Protocol::WebSocket::Frame::MAX_FRAGMENTS_AMOUNT = 102400;
-    
+
 $| = 1;
 
 my $network;
@@ -68,7 +68,7 @@ if( not $network or not $ok or scalar(@ARGV) > 0 )
         "  --redis_sentinels=S1 --redis_sentinels=S2...\n",
         "  --redis_service=SVC\n",
         "  --redis_queue=Q    \[$redis_queue\]\n";
-    
+
     exit 1;
 }
 
@@ -96,7 +96,7 @@ if( $use_redis )
 
     $redis = Redis::Fast->new(%args);
 }
-    
+
 
 my $dbh = DBI->connect($dsn, $db_user, $db_password,
                        {'RaiseError' => 1, AutoCommit => 0,
@@ -129,7 +129,7 @@ my %watchcontracts;
     die('nothing in WATCH_CONTRACTS') if scalar(@{$r}) == 0;
     foreach my $row (@{$r}) {
         $watchcontracts{$row->[0]} = 1;
-        print STDERR "Watching contract: " . $row->[0] . "\n"; 
+        print STDERR "Watching contract: " . $row->[0] . "\n";
     }
 }
 
@@ -143,9 +143,12 @@ if( $use_redis )
     my $r = $sth->fetchall_arrayref();
     foreach my $row (@{$r}) {
         $redisexport{$row->[0]} = 1;
-        print STDERR "Exporting contract deltas: " . $row->[0] . "\n"; 
-    }    
+        print STDERR "Exporting contract deltas: " . $row->[0] . "\n";
+    }
 }
+
+my %lastupd;
+my %prev_lastupd;
 
 my $tbl_rows = $network . '_ROWS';
 my $tbl_upd_op = $network . '_UPD_OP';     # row operation: new/modified/deleted
@@ -154,7 +157,7 @@ my $tbl_upd_prev = $network . '_UPD_PREV'; # row values before updates
 {
     my $sth = $dbh->prepare
         ('SELECT count(*) FROM information_schema.tables where table_schema=DATABASE() and table_name=?');
-           
+
     $sth->execute($tbl_rows);
     my $r = $sth->fetchall_arrayref();
     if( $r->[0][0] == 0 )
@@ -173,13 +176,13 @@ my $tbl_upd_prev = $network . '_UPD_PREV'; # row values before updates
 
         $dbh->do('CREATE INDEX ' . $tbl_rows . '_I02 ON ' . $tbl_rows .
                  '(contract, scope, tbl, field, fval(64))');
-        
+
         $dbh->do('CREATE INDEX ' . $tbl_rows . '_I03 ON ' . $tbl_rows .
                  '(contract, tbl, field, fval(64))');
 
         $dbh->do('CREATE INDEX ' . $tbl_rows . '_I04 ON ' . $tbl_rows .
                  '(fval(64))');
-        
+
         $dbh->do('CREATE TABLE ' . $tbl_upd_op . '( ' .
                  'block_num BIGINT UNSIGNED NOT NULL, ' .
                  'opseq     INT UNSIGNED NOT NULL, ' .
@@ -205,7 +208,7 @@ my $tbl_upd_prev = $network . '_UPD_PREV'; # row values before updates
 
         $dbh->do('CREATE INDEX ' . $tbl_upd_prev . '_I01 ON ' . $tbl_upd_prev .
                  '(block_num, opseq)');
-        
+
         $dbh->do
             ('INSERT INTO SYNC (network, block_num, block_time, irreversible) ' .
              'VALUES(\'' . $network . '\',0,\'2000-01-01\', 0) ' .
@@ -276,6 +279,10 @@ my $sth_select_prev = $dbh->prepare
     ('SELECT opseq, contract, scope, tbl, pk, field, fval FROM ' . $tbl_upd_prev . ' ' .
      'WHERE block_num=?');
 
+my $sth_lastupd = $dbh->prepare
+    ('INSERT INTO CONTRACT_LAST_UPD (network, contract, block_num) ' .
+     'VALUES(?,?,?) ' .
+     'ON DUPLICATE KEY UPDATE block_num=?');
 
 
 
@@ -301,8 +308,8 @@ Net::WebSocket::Server->new(
                     print STDERR $@, "\n\n";
                     print STDERR $js, "\n";
                     exit;
-                } 
-                
+                }
+
                 my $ack = process_data($msgtype, $data, \$js);
                 if( $ack > 0 )
                 {
@@ -323,7 +330,7 @@ Net::WebSocket::Server->new(
                 $committed_block = 0;
                 $uncommitted_block = 0;
             },
-            
+
             );
     },
     )->start;
@@ -354,12 +361,13 @@ sub process_data
                 $prevval{$seq}{$contract}{$scope}{$tbl}{$pk}{$field} = $fval;
             }
 
-            
+
             $sth_select_op->execute($bn);
             my $r = $sth_select_op->fetchall_arrayref();
             foreach my $oprec (@{$r})
             {
                 my ($seq, $op, $contract, $scope, $tbl, $pk) = @{$oprec};
+                $lastupd{$contract} = $block_num;
                 if( $op == 1 )
                 {
                     # row was inserted, now delete it
@@ -395,7 +403,8 @@ sub process_data
             printf STDERR ("Rolled back block %d\n", $bn);
             $uncommitted_block--;
         }
-        
+
+        save_lastupd();
         $dbh->commit();
         $uncommitted_block = $block_num-1;
         $stored_block = $uncommitted_block;
@@ -413,20 +422,22 @@ sub process_data
         if( exists($redisexport{$contract}) ) {
             $redis->lpush($redis_queue, ${$jsref});
         }
-        
+
         my $block_num = $data->{'block_num'};
         my $scope = $kvo->{'scope'};
         my $tbl = $kvo->{'table'};
         my $pk = $kvo->{'primary_key'};
 
+        $lastupd{$contract} = $block_num;
+
         if( $block_num > $last_irreversible )
         {
             my $op;
-            
+
             $sth_check_row->execute($contract, $scope, $tbl, $pk);
             my $prevrow = $sth_check_row->fetchall_arrayref();
             if( scalar(@{$prevrow}) > 0 )
-            {               
+            {
                 if( $data->{'added'} eq 'true' )
                 {
                     # this is an update of existing row
@@ -452,7 +463,7 @@ sub process_data
                     return 0;
                 }
             }
-        
+
             # row modified or deleted; save the previous values
             $sth_ins_op->execute($block_num, $opseq, $op, $contract, $scope, $tbl, $pk);
             if( $op != 1 )
@@ -462,7 +473,7 @@ sub process_data
                     $sth_ins_prev->execute($block_num, $opseq, $contract, $scope, $tbl, $pk, @{$prevval});
                 }
             }
-            
+
             if( $op != 3 ) # row inserted or modified
             {
                 while(my ($field, $fval) = each %{$kvo->{'value'}})
@@ -526,8 +537,8 @@ sub process_data
                 # row deleted
                 $sth_del_row->execute($contract, $scope, $tbl, $pk);
             }
-        }            
-        
+        }
+
         $rows_counter++;
     }
     elsif( $msgtype == 1009 ) # CHRONICLE_MSGTYPE_RCVR_PAUSE
@@ -537,6 +548,7 @@ sub process_data
             if( $uncommitted_block > $stored_block )
             {
                 $sth_fork_sync->execute($network, $uncommitted_block);
+                save_lastupd();
                 $dbh->commit();
                 $stored_block = $uncommitted_block;
             }
@@ -557,7 +569,7 @@ sub process_data
             $sth_clean_prev->execute($last_irreversible);
             $sth_clean_op->execute($last_irreversible);
         }
-                
+
         if( $uncommitted_block - $committed_block >= $commit_every or
             $uncommitted_block >= $endblock )
         {
@@ -570,19 +582,20 @@ sub process_data
                 my $epoch = timegm_nocheck($sec, $min, $hour, $mday, $mon-1, $year);
                 $gap = (time() - $epoch)/3600.0;
             }
-            
+
             my $period = time() - $counter_start;
             printf STDERR ("blocks/s: %8.2f, rows/block: %8.2f, gap: %8.2fh, ",
                            $blocks_counter/$period, $rows_counter/$blocks_counter, $gap);
             $counter_start = time();
             $blocks_counter = 0;
             $rows_counter = 0;
-            
+
             if( $uncommitted_block > $stored_block )
             {
                 my $block_time = $data->{'block_timestamp'};
                 $block_time =~ s/T/ /;
                 $sth_upd_sync->execute($uncommitted_block, $block_time, $last_irreversible, $network);
+                save_lastupd();
                 $dbh->commit();
                 $stored_block = $uncommitted_block;
             }
@@ -595,10 +608,15 @@ sub process_data
 
 
 
-
-
-    
-        
-
-
-   
+sub save_lastupd
+{
+    foreach my $contract (keys %lastupd)
+    {
+        my $block_num = $lastupd{$contract};
+        if( not exists($prev_lastupd{$contract}) or $prev_lastupd{$contract} != $block_num )
+        {
+            $sth_lastupd->execute($network, $contract, $block_num, $block_num);
+            $prev_lastupd{$contract} = $block_num;
+        }
+    }
+}
