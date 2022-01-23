@@ -213,6 +213,7 @@ my $tbl_upd_prev = $network . '_UPD_PREV'; # row values before updates
             ('INSERT INTO SYNC (network, block_num, block_time, irreversible) ' .
              'VALUES(\'' . $network . '\',0,\'2000-01-01\', 0) ' .
              'ON DUPLICATE KEY UPDATE block_num=0, block_time=\'2020-01-01\', irreversible=0');
+        $dbh->commit();
     }
 }
 
