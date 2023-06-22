@@ -312,7 +312,7 @@ Net::WebSocket::Server->new(
                 }
 
                 my $ack = process_data($msgtype, $data, \$js);
-                if( $ack > 0 )
+                if( $ack >= 0 )
                 {
                     $conn->send_binary(sprintf("%d", $ack));
                     print STDERR "ack $ack\n";
@@ -417,8 +417,8 @@ sub process_data
         my $kvo = $data->{'kvo'};
         my $contract = $kvo->{'code'};
 
-        return(0) unless exists($watchcontracts{$contract});
-        return(0) unless ref($kvo->{'value'}) eq 'HASH';
+        return(-1) unless exists($watchcontracts{$contract});
+        return(-1) unless ref($kvo->{'value'}) eq 'HASH';
 
         if( exists($redisexport{$contract}) ) {
             $redis->lpush($redis_queue, ${$jsref});
@@ -461,7 +461,7 @@ sub process_data
                 {
                     #print STDERR "Database corrupted, row deleted but does not exist: " .
                     #    join(',', $contract, $scope, $tbl, $pk) . "\n";
-                    return 0;
+                    return -1;
                 }
             }
 
@@ -604,7 +604,7 @@ sub process_data
         }
     }
 
-    return 0;
+    return -1;
 }
 
 
